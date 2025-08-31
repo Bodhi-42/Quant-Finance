@@ -1,60 +1,44 @@
 from datetime import datetime
 import numpy as np
-import numpy_financial as npf   # for IRR (Money Weighted Return)
+from scipy.optimize import brentq
 
 class Portfolio:
     def __init__(self, cf, aum):
         self.cf = cf
         self.aum = aum
+        self.dates = np.array([datetime.strptime(d["date"], "%Y-%m-%d") for d in cf])
+        self.flows = np.array([d["flow"] for d in cf], dtype=float)
 
-    def twr(self):
-        # Pre-extract dates to avoid repeated parsing
-        dates = [datetime.strptime(d["date"], "%Y-%m-%d") for d in self.cf]
-        flows = np.array([d["flow"] for d in self.cf])
+    # ---- Time-Weighted Return (vectorized over subperiods) ----
+    def twr(self, annualize=True):
+        # subperiod starts/ends
+        starts = np.array([self.aum[self.cf[i]["date"]] for i in range(len(self.cf)-1)], dtype=float)
+        ends   = np.array([self.aum[self.cf[i+1]["date"]] for i in range(len(self.cf)-1)], dtype=float)
+        flows_end = self.flows[1:]  # flow at end of each subperiod
+        sub_gross = (ends - flows_end) / starts   # R_i = (V_{i+1}-CF_{i+1})/V_i
+        gross = sub_gross.prod()
+        if not annualize:
+            return gross - 1
+        total_days = (self.dates[-1] - self.dates[0]).days
+        return gross**(365/total_days) - 1
 
-        # Compute sub-period returns in one vectorized pass
-        sub_returns = []
-        for i in range(len(dates) - 1):
-            start_val = self.aum[self.cf[i]["date"]]
-            end_val = self.aum[self.cf[i+1]["date"]] + flows[i+1]
-            sub_returns.append(end_val / start_val)
-
-        twr = np.prod(sub_returns)
-        total_days = (dates[-1] - dates[0]).days
-        return twr**(365 / total_days) - 1
+    # ---- Money-Weighted Return (XIRR with irregular dates) ----
+    def _xnpv(self, r):
+        t0 = self.dates[0]
+        years = np.array([(d - t0).days/365 for d in self.dates], dtype=float)
+        cf = self.flows.copy()
+        cf[-1] += self.aum[self.cf[-1]["date"]]   # add terminal market value
+        return np.sum(cf / (1 + r)**years)
 
     def mwr(self):
-        # Extract cashflows
-        cf = np.array([d["flow"] for d in self.cf])
-        # Add final portfolio value to last cashflow
-        cf[-1] += self.aum[self.cf[-1]["date"]]
-
-        # IRR gives periodic return (assuming equally spaced periods)
-        irr = npf.irr(cf)
-        if irr is None:
-            return None
-
-        # Annualize IRR based on total horizon
-        dates = [datetime.strptime(d["date"], "%Y-%m-%d") for d in self.cf]
-        total_years = (dates[-1] - dates[0]).days / 365
-        return (1 + irr) ** (1 / total_years) - 1
-
-
-# Example
-cash_flows = [
-    {"date": "2024-01-01", "flow": -1000},   # Initial investment
-    {"date": "2024-03-01", "flow": -500},    # Additional investment
-    {"date": "2024-06-01", "flow": 200},     # Withdrawal
-    {"date": "2024-12-31", "flow": 0}        # End date
-]
-
-portfolio_values = {
-    "2024-01-01": 1000,
-    "2024-03-01": 1800,
-    "2024-06-01": 1600,
-    "2024-12-31": 2200
-}
-
-p1 = Portfolio(cash_flows, portfolio_values)
-print("TWR:", p1.twr())
-print("MWR:", p1.mwr())
+        # bracket the root robustly, then solve with brentq
+        lo, hi = -0.9999, 10.0
+        f_lo, f_hi = self._xnpv(lo), self._xnpv(hi)
+        tries = 0
+        while f_lo * f_hi > 0 and tries < 25:
+            hi *= 2.0
+            f_hi = self._xnpv(hi)
+            tries += 1
+        if f_lo * f_hi > 0:
+            raise RuntimeError("Could not bracket XIRR root (cash flows may not change sign).")
+        return brentq(lambda r: self._xnpv(r), lo, hi, maxiter=200)
